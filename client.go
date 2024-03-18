@@ -292,6 +292,7 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 			}
 			// this means there are changes, and it's also the end of the entry
 			if s.HasClass("Version-details") {
+				s.Find(".Version-summary").Find("span").Remove()
 				dateStr := strings.TrimSpace(s.Find(".Version-summary").Text())
 				t, err := normalizeTime(dateStr)
 				if err != nil {
