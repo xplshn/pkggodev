@@ -92,6 +92,11 @@ type DescribePackageRequest struct {
 	Package string
 }
 
+type Image struct {
+	Alt string
+	URL string
+}
+
 type Package struct {
 	Package                   string
 	IsModule                  bool
@@ -104,6 +109,8 @@ type Package struct {
 	HasTaggedVersion          bool
 	HasStableVersion          bool
 	Repository                string
+	Synopsis                  string
+	Images                    []Image
 }
 
 func (c *client) DescribePackage(req DescribePackageRequest) (*Package, error) {
@@ -120,8 +127,6 @@ func (c *client) DescribePackage(req DescribePackageRequest) (*Package, error) {
 		licenseStr := e.DOM.Children().First().Text()
 		p.License = strings.TrimSpace(licenseStr)
 	})
-	// metadata are in a list, so parse it all at once
-	// TODO: add some extra validation here, so we error if things change order
 	col.OnHTML(".UnitMeta", func(e *colly.HTMLElement) {
 		lis := e.DOM.Find("li")
 		lis.Each(func(i int, s *goquery.Selection) {
@@ -162,16 +167,32 @@ func (c *client) DescribePackage(req DescribePackageRequest) (*Package, error) {
 			case "module":
 				p.IsModule = true
 			default:
-				// I'm not aware of a case where package=false,
-				// so if we've gotten here and package=false then
-				// return an error since it probably means
-				// that we parsed incorrectly
 				if !p.IsPackage && !p.IsModule {
 					errs.Errs = append(errs.Errs, fmt.Errorf("IsPackage=false after parsing page for '%s', this probably indicates a parsing bug", req.Package))
 				}
 				return
 			}
 		}
+	})
+	col.OnHTML(".SearchSnippet-synopsis", func(e *colly.HTMLElement) {
+		p.Synopsis = strings.TrimSpace(e.Text)
+	})
+	col.OnHTML(".UnitReadme-content img", func(e *colly.HTMLElement) {
+		alt, _ := e.DOM.Attr("alt")
+		src, _ := e.DOM.Attr("src")
+		// Ensure URL is absolute
+		url := src
+		if !strings.HasPrefix(src, "http") {
+			if strings.HasPrefix(src, "/") {
+				url = c.baseURL + src
+			} else {
+				url = c.baseURL + "/" + src
+			}
+		}
+		p.Images = append(p.Images, Image{
+			Alt: alt,
+			URL: url,
+		})
 	})
 
 	col.OnError(func(r *colly.Response, e error) {
@@ -192,35 +213,26 @@ type Versions struct {
 	Package  string
 	Versions []Version
 }
+
 type Version struct {
 	MajorVersion string
 	FullVersion  string
 	Date         string
 }
 
-// TODO: parse the changes and wire them up to Version
 type Change struct {
 	URL            string
 	Symbol         string
 	SymbolSynopsis string
 }
 
-// normalizeTime normalizes a time string into a consistent format.
-// Times are generally represented as dates, so this only returns a date string, not a time string.
-// It handles cases of durations as well like '1 hour ago' which are sometimes used (like in search results).
-// Parsed durations are returned as times relative to now.
 func normalizeTime(s string) (string, error) {
 	var absTime time.Time
 
-	// as far as I can tell, the UI only uses "<quantity> hours ago" or "<quantity> days ago"
-	// e.g. "2 hours ago", "1 hours ago", "0 hours ago", "5 days ago", etc.
-	// at some point it switches back to an absolute date
-	// you can find examples at https://index.golang.org/index?since=2021-10-10T09:08:52.997264Z
 	if s == "today" {
 		absTime = time.Now()
 	} else if strings.Contains(s, "ago") {
 		now := time.Now()
-		// <quantity> <unit>[s] ago
 		split := strings.Split(s, " ")
 		quantityStr := split[0]
 		quantity, err := strconv.ParseInt(quantityStr, 10, 64)
@@ -255,7 +267,6 @@ type VersionsRequest struct {
 }
 
 func (c *client) Versions(req VersionsRequest) (*Versions, error) {
-	//https://pkg.go.dev/github.com/ipfs/ipfs-cluster/ipfsconn/ipfshttp?tab=versions
 	col := c.newCollector()
 	errs := &ErrorList{}
 
@@ -264,11 +275,8 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 		var curVersion Version
 		var curMajorVersion string
 		e.DOM.Children().Each(func(i int, s *goquery.Selection) {
-			// start of a new version entry
-			// this is always present, but sometimes it's empty
 			if s.HasClass("Version-major") {
 				mv := strings.TrimSpace(s.Text())
-				// if it's empty, we just continue using the existing mv
 				if mv != "" {
 					curMajorVersion = mv
 				}
@@ -278,7 +286,6 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 				version := s.Find(".js-versionLink").Text()
 				curVersion.FullVersion = version
 			}
-			// this means there are no changes, and it's the end of the entry
 			if s.HasClass("Version-commitTime") {
 				dateStr := strings.TrimSpace(s.Text())
 				t, err := normalizeTime(dateStr)
@@ -290,7 +297,6 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 				versions.Versions = append(versions.Versions, curVersion)
 				curVersion = Version{}
 			}
-			// this means there are changes, and it's also the end of the entry
 			if s.HasClass("Version-details") {
 				s.Find(".Version-summary").Find("span").Remove()
 				dateStr := strings.TrimSpace(s.Find(".Version-summary").Text())
@@ -302,8 +308,6 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 				curVersion.Date = t
 				versions.Versions = append(versions.Versions, curVersion)
 				curVersion = Version{}
-
-				// TODO: parse the changes
 			}
 		})
 	})
@@ -317,6 +321,9 @@ func (c *client) Versions(req VersionsRequest) (*Versions, error) {
 	})
 
 	col.Visit(fmt.Sprintf("%s/%s?tab=versions", c.baseURL, req.Package))
+	if len(errs.Errs) > 0 {
+		return nil, errs
+	}
 	return versions, nil
 }
 
@@ -345,7 +352,6 @@ func (c *client) Search(req SearchRequest) (*SearchResults, error) {
 
 	morePages := true
 
-	// on page n, compute if we should follow to page n+1
 	col.OnHTML("[data-test-id=results-total]", func(e *colly.HTMLElement) {
 		resultsStr := strings.TrimSpace(e.Text)
 		if resultsStr == "0 results" {
@@ -353,10 +359,8 @@ func (c *client) Search(req SearchRequest) (*SearchResults, error) {
 		}
 		resultsSplit := strings.Split(resultsStr, " ")
 		if len(resultsSplit) == 2 {
-			// e.g. "1 result", "2 results", ...
 			morePages = false
 		} else {
-			// e.g. "1 - 25 of 125 results", "26-50 of 125 results", ...
 			upperBoundStr := resultsSplit[2]
 			upperBound, err := strconv.Atoi(upperBoundStr)
 			if err != nil {
@@ -365,7 +369,6 @@ func (c *client) Search(req SearchRequest) (*SearchResults, error) {
 			}
 
 			totalResultsStr := resultsSplit[4]
-
 			reachedReqLimit := upperBound >= req.Limit
 			reachedLastPage := upperBoundStr == totalResultsStr
 			morePages = !reachedReqLimit && !reachedLastPage
@@ -381,13 +384,7 @@ func (c *client) Search(req SearchRequest) (*SearchResults, error) {
 		synopsis := strings.TrimSpace(e.DOM.Find(".SearchSnippet-synopsis").Text())
 		info := e.DOM.Find(".SearchSnippet-infoLabel")
 
-		// pseudoversions are truncated and contain '...', so we have to do an additional lookup
-		// it is of the format "v0.0.0-...-<hash>" so we can be confident in the lookup
-		// for now we just leave version blank if it's a pseudoversion, so searches don't take a long time
-		// we can add a flag to turn on version info later
-		// TODO: add flag to turn on inclusion of full pseudoversions
 		version := strings.TrimSpace(info.Find("[data-test-id=snippet-version]").Text())
-
 		publishedDateStr := strings.TrimSpace(info.Find("[data-test-id=snippet-published]").Text())
 		published, err := normalizeTime(publishedDateStr)
 		if err != nil {
