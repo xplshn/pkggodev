@@ -7,9 +7,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"net/url"
+	"regexp"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gocolly/colly/v2"
+	"github.com/projectdiscovery/useragent"
 )
 
 type client struct {
@@ -54,6 +57,16 @@ func (c *client) newCollector() *colly.Collector {
 	if c.httpClient != nil {
 		col.SetClient(c.httpClient)
 	}
+
+	filters := []useragent.Filter{
+		useragent.Chrome,
+		// useragent.Mozilla, // Trash corporation
+	}
+	uas, err := useragent.PickWithFilters(1, filters...)
+	if err == nil && len(uas) > 0 {
+		col.UserAgent = uas[0].Raw
+	}
+
 	return col
 }
 
@@ -174,13 +187,10 @@ func (c *client) DescribePackage(req DescribePackageRequest) (*Package, error) {
 			}
 		}
 	})
-	col.OnHTML(".SearchSnippet-synopsis", func(e *colly.HTMLElement) {
-		p.Synopsis = strings.TrimSpace(e.Text)
-	})
 	col.OnHTML(".UnitReadme-content img", func(e *colly.HTMLElement) {
 		alt, _ := e.DOM.Attr("alt")
 		src, _ := e.DOM.Attr("src")
-		// Ensure URL is absolute
+		// URL must be absolute
 		url := src
 		if !strings.HasPrefix(src, "http") {
 			if strings.HasPrefix(src, "/") {
@@ -350,73 +360,97 @@ func (c *client) Search(req SearchRequest) (*SearchResults, error) {
 	results := &SearchResults{}
 	errs := &ErrorList{}
 
-	morePages := true
+	shouldContinue := true
+	page := 1
 
-	col.OnHTML("[data-test-id=results-total]", func(e *colly.HTMLElement) {
-		resultsStr := strings.TrimSpace(e.Text)
-		if resultsStr == "0 results" {
+	col.OnHTML(".SearchResults", func(e *colly.HTMLElement) {
+		// Check if there are any results
+		if e.DOM.Find(".SearchSnippet").Length() == 0 {
+			shouldContinue = false
 			return
 		}
-		resultsSplit := strings.Split(resultsStr, " ")
-		if len(resultsSplit) == 2 {
-			morePages = false
-		} else {
-			upperBoundStr := resultsSplit[2]
-			upperBound, err := strconv.Atoi(upperBoundStr)
-			if err != nil {
-				errs.Errs = append(errs.Errs, err)
+
+		// Process each search result
+		e.DOM.Find(".SearchSnippet").Each(func(i int, s *goquery.Selection) {
+			if len(results.Results) >= req.Limit {
+				shouldContinue = false
 				return
 			}
 
-			totalResultsStr := resultsSplit[4]
-			reachedReqLimit := upperBound >= req.Limit
-			reachedLastPage := upperBoundStr == totalResultsStr
-			morePages = !reachedReqLimit && !reachedLastPage
-		}
+			// Extract package name from the title link
+			titleLink := s.Find(".SearchSnippet-headerContainer a").First()
+			pkg := strings.TrimSpace(titleLink.Text())
+
+			// Extract synopsis
+			synopsis := strings.TrimSpace(s.Find(".SearchSnippet-synopsis").Text())
+
+			// Extract metadata from the info section
+			infoSection := s.Find(".SearchSnippet-infoLabel")
+
+			// Extract version from the strong tag in the version section
+			versionText := infoSection.Contents().Filter("span").Text()
+			version := ""
+			if versionParts := strings.Split(versionText, " published on "); len(versionParts) > 0 {
+				version = strings.TrimSpace(strings.Trim(versionParts[0], " \t\n\r"))
+			}
+
+			// Extract published date
+			publishedDateStr := strings.TrimSpace(infoSection.Find("[data-test-id=snippet-published] strong").Text())
+			published, err := normalizeTime(publishedDateStr)
+			if err != nil {
+				errs.Errs = append(errs.Errs, fmt.Errorf("parsing published date '%s': %w", publishedDateStr, err))
+				published = publishedDateStr // Use original if parsing fails
+			}
+
+			// Extract imported by count
+			importedByText := strings.TrimSpace(infoSection.Find("a[href*='tab=importedby'] strong").Text())
+			importedByStr := strings.ReplaceAll(importedByText, ",", "")
+			importedBy, err := strconv.Atoi(importedByStr)
+			if err != nil {
+				importedBy = 0
+			}
+
+			// Extract license
+			license := strings.TrimSpace(infoSection.Find("[data-test-id=snippet-license] a").Text())
+			if license == "" {
+				license = strings.TrimSpace(infoSection.Find("[data-test-id=snippet-license]").Text())
+			}
+
+			result := SearchResult{
+				Package:    pkg,
+				Synopsis:   synopsis,
+				Version:    version,
+				Published:  published,
+				ImportedBy: importedBy,
+				License:    license,
+			}
+			results.Results = append(results.Results, result)
+		})
 	})
 
-	col.OnHTML(".LegacySearchSnippet", func(e *colly.HTMLElement) {
-		if len(results.Results) == req.Limit {
-			return
-		}
-
-		pkg := strings.TrimSpace(e.DOM.Find("[data-test-id=snippet-title]").Text())
-		synopsis := strings.TrimSpace(e.DOM.Find(".SearchSnippet-synopsis").Text())
-		info := e.DOM.Find(".SearchSnippet-infoLabel")
-
-		version := strings.TrimSpace(info.Find("[data-test-id=snippet-version]").Text())
-		publishedDateStr := strings.TrimSpace(info.Find("[data-test-id=snippet-published]").Text())
-		published, err := normalizeTime(publishedDateStr)
-		if err != nil {
-			errs.Errs = append(errs.Errs, err)
-			return
-		}
-		importedByWithCommas := strings.TrimSpace(info.Find("[data-test-id=snippet-importedby]").Text())
-		importedByStr := strings.ReplaceAll(importedByWithCommas, ",", "")
-		importedBy, err := strconv.Atoi(importedByStr)
-		if err != nil {
-			errs.Errs = append(errs.Errs, err)
-			return
-		}
-		license := strings.TrimSpace(info.Find("[data-test-id=snippet-license]").Text())
-		result := SearchResult{
-			Package:    pkg,
-			Synopsis:   synopsis,
-			Version:    version,
-			Published:  published,
-			ImportedBy: importedBy,
-			License:    license,
-		}
-		results.Results = append(results.Results, result)
-	})
 	col.OnError(func(r *colly.Response, e error) {
-		errs.Errs = append(errs.Errs, e)
+		errs.Errs = append(errs.Errs, fmt.Errorf("error fetching %s: %w", r.Request.URL.String(), e))
+		shouldContinue = false
 	})
-	for page := 1; morePages; page++ {
-		col.Visit(fmt.Sprintf("%s/search?q=%s&m=package&page=%d", c.baseURL, req.Query, page))
-		if len(errs.Errs) > 0 {
-			return nil, errs
+
+	// Start scraping from page 1
+	for shouldContinue && len(results.Results) < req.Limit {
+		url := fmt.Sprintf("%s/search?q=%s&page=%d", c.baseURL, req.Query, page)
+		err := col.Visit(url)
+		if err != nil {
+			errs.Errs = append(errs.Errs, fmt.Errorf("visiting page %d: %w", page, err))
+			break
 		}
+		page++
+
+		// Prevent infinite loops
+		if page > 10 {
+			break
+		}
+	}
+
+	if len(errs.Errs) > 0 {
+		return nil, errs
 	}
 
 	return results, nil
@@ -449,4 +483,175 @@ type License struct {
 
 func (c *client) Licenses(req LicensesRequest) ([]License, error) {
 	return nil, nil
+}
+
+// GitHostType represents the type of git hosting service
+type GitHostType int
+
+const (
+	GitHostUnknown GitHostType = iota
+	GitHostGitHub
+	GitHostGitLab
+	GitHostCodeberg
+	GitHostSourcehut
+)
+
+// identifyGitHost determines the git hosting service from a repository URL
+func identifyGitHost(repoURL string) GitHostType {
+	u, err := url.Parse(repoURL)
+	if err != nil {
+		return GitHostUnknown
+	}
+
+	switch {
+	case strings.Contains(u.Host, "github.com"):
+		return GitHostGitHub
+	case strings.Contains(u.Host, "gitlab.com"):
+		return GitHostGitLab
+	case strings.Contains(u.Host, "codeberg.org"):
+		return GitHostCodeberg
+	case strings.Contains(u.Host, "git.sr.ht"):
+		return GitHostSourcehut
+	default:
+		return GitHostUnknown
+	}
+}
+
+// normalizeRepoURL converts various repository URL formats to web-accessible URLs
+func normalizeRepoURL(repoURL string) string {
+	// Convert git+ssh URLs to https
+	if strings.HasPrefix(repoURL, "git@") {
+		// git@github.com:user/repo.git -> https://github.com/user/repo
+		re := regexp.MustCompile(`git@([^:]+):(.+)\.git$`)
+		matches := re.FindStringSubmatch(repoURL)
+		if len(matches) == 3 {
+			return fmt.Sprintf("https://%s/%s", matches[1], matches[2])
+		}
+	}
+
+	if strings.HasSuffix(repoURL, ".git") {
+		repoURL = strings.TrimSuffix(repoURL, ".git")
+	}
+
+	return "https://" + repoURL
+}
+
+func (c *client) fetchDescription(repoURL string) string {
+	if repoURL == "" {
+		return ""
+	}
+
+	normalizedURL := normalizeRepoURL(repoURL)
+	hostType := identifyGitHost(normalizedURL)
+
+	switch hostType {
+	case GitHostGitHub:
+		return c.extractGitHubDescription(normalizedURL)
+	case GitHostGitLab:
+		return c.extractGitLabDescription(normalizedURL)
+	case GitHostCodeberg:
+		return c.extractCodebergDescription(normalizedURL)
+	case GitHostSourcehut:
+		return c.extractSourcehutDescription(normalizedURL)
+	default:
+		return ""
+	}
+}
+
+// extractGitHubDescription extracts description from GitHub repository page
+func (c *client) extractGitHubDescription(repoURL string) string {
+	col := c.newCollector()
+	var description string
+
+	col.OnHTML("p[class*='f4']", func(e *colly.HTMLElement) {
+		if description == "" {
+			text := strings.TrimSpace(e.Text)
+			if text != "" && !strings.Contains(text, "http") {
+				description = text
+			}
+		}
+	})
+
+	col.Visit(repoURL)
+	return description
+}
+
+// extractGitLabDescription extracts description from GitLab repository page
+func (c *client) extractGitLabDescription(repoURL string) string {
+	col := c.newCollector()
+	var description string
+
+	col.OnHTML(".home-panel-description-markdown p", func(e *colly.HTMLElement) {
+		if description == "" {
+			description = strings.TrimSpace(e.Text)
+		}
+	})
+
+	col.Visit(repoURL)
+	return description
+}
+
+// extractCodebergDescription extracts description from Codeberg repository page
+func (c *client) extractCodebergDescription(repoURL string) string {
+	col := c.newCollector()
+	var description string
+
+	col.OnHTML(".repo-description .description", func(e *colly.HTMLElement) {
+		if description == "" {
+			description = strings.TrimSpace(e.Text)
+		}
+	})
+
+	col.Visit(repoURL)
+	return description
+}
+
+// extractSourcehutDescription extracts description from Sourcehut repository page
+func (c *client) extractSourcehutDescription(repoURL string) string {
+	col := c.newCollector()
+	var description string
+
+	// Sourcehut often has README content that serves as description
+	col.OnHTML(".blob-content p", func(e *colly.HTMLElement) {
+		if description == "" {
+			text := strings.TrimSpace(e.Text)
+			if len(text) > 10 && len(text) < 200 {
+				description = text
+			}
+		}
+	})
+
+	col.Visit(repoURL)
+	return description
+}
+
+// Sprinkle enhances a Package with additional metadata fetched from its repository
+func (c *client) Sprinkle(p *Package) error {
+	fmt.Println("here")
+
+	if p == nil {
+		return fmt.Errorf("package is nil")
+	}
+
+	if p.Repository == "" {
+		return fmt.Errorf("no repository URL available")
+	}
+
+	// Fetch description from repository
+	description := c.fetchDescription(p.Repository)
+	if description == "" {
+		return fmt.Errorf("could not fetch description from repository")
+	}
+
+	// Clean up the description
+	description = strings.TrimSpace(description)
+	if len(description) > 500 {
+		description = description[:500] + "...>"
+	}
+
+	p.Synopsis = description
+
+	fmt.Println(p.Synopsis)
+
+	return nil
 }
