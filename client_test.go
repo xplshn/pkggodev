@@ -1,4 +1,4 @@
-package pkggodevclient
+package pkggodev
 
 import (
 	"errors"

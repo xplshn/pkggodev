@@ -7,7 +7,7 @@ import (
 	"reflect"
 
 	"github.com/gosuri/uitable"
-	pkggodevclient "github.com/guseggert/pkggodev-client"
+	"github.com/xplshn/pkggodev"
 	"github.com/logrusorgru/aurora/v3"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -31,8 +31,8 @@ func init() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client := pkggodevclient.New()
-			importedBy, err := client.ImportedBy(pkggodevclient.ImportedByRequest{
+			client := pkggodev.New()
+			importedBy, err := client.ImportedBy(pkggodev.ImportedByRequest{
 				Package: args[0],
 			})
 			if err != nil {
@@ -55,8 +55,8 @@ func init() {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			query := args[0]
-			client := pkggodevclient.New()
-			res, err := client.Search(pkggodevclient.SearchRequest{
+			client := pkggodev.New()
+			res, err := client.Search(pkggodev.SearchRequest{
 				Query: query,
 				Limit: searchLimit,
 			})
@@ -76,8 +76,8 @@ func init() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client := pkggodevclient.New()
-			versions, err := client.Versions(pkggodevclient.VersionsRequest{
+			client := pkggodev.New()
+			versions, err := client.Versions(pkggodev.VersionsRequest{
 				Package: args[0],
 			})
 			if err != nil {
@@ -97,9 +97,9 @@ func init() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			client := pkggodevclient.New()
+			client := pkggodev.New()
 			for _, pkg := range args {
-				d, err := client.DescribePackage(pkggodevclient.DescribePackageRequest{
+				d, err := client.DescribePackage(pkggodev.DescribePackageRequest{
 					Package: pkg,
 				})
 				if err != nil {

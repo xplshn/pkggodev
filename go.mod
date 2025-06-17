@@ -1,4 +1,4 @@
-module github.com/guseggert/pkggodev-client
+module github.com/xplshn/pkggodev
 
 go 1.17
 
